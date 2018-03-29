@@ -1,0 +1,402 @@
+diff --git a/include/syscall.h b/include/syscall.h
+index c55cec2..cd9bd81 100644
+--- a/include/syscall.h
++++ b/include/syscall.h
+@@ -23,5 +23,6 @@
+ #define SYS_sbrk   19
+ #define SYS_sleep  20
+ #define SYS_uptime 21
+-
++#define SYS_shmem_access 22
++#define SYS_shmem_count  23
+ #endif // _SYSCALL_H_
+diff --git a/kernel/defs.h b/kernel/defs.h
+index c12f8ff..420dcb0 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -168,7 +168,12 @@ pde_t*          copyuvm(pde_t*, uint);
+ void            switchuvm(struct proc*);
+ void            switchkvm(void);
+ int             copyout(pde_t*, uint, void*, uint);
+-
++int 		shmem_exist(int);
++void*           shmem_access(int);
++int             shmem_count(int);
++void            forkupdate(struct proc*);
++void            freeshmem(struct proc*);
++void            initshmem(void);
+ // number of elements in fixed-size array
+ #define NELEM(x) (sizeof(x)/sizeof((x)[0]))
+ 
+diff --git a/kernel/exec.c b/kernel/exec.c
+index 05f80f8..d92bebf 100644
+--- a/kernel/exec.c
++++ b/kernel/exec.c
+@@ -32,7 +32,7 @@ exec(char *path, char **argv)
+     goto bad;
+ 
+   // Load program into memory.
+-  sz = 0;
++  sz = PGSIZE;
+   for(i=0, off=elf.phoff; i<elf.phnum; i++, off+=sizeof(ph)){
+     if(readi(ip, (char*)&ph, off, sizeof(ph)) != sizeof(ph))
+       goto bad;
+@@ -87,8 +87,12 @@ exec(char *path, char **argv)
+   proc->tf->eip = elf.entry;  // main
+   proc->tf->esp = sp;
+   switchuvm(proc);
+-  freevm(oldpgdir);
+ 
++  proc->nshmem = 0;
++  for(i = 0; i < NSHMEM; ++i)
++    proc->shmem[i] = NULL;
++ 
++  freevm(oldpgdir);
+   return 0;
+ 
+  bad:
+diff --git a/kernel/main.c b/kernel/main.c
+index e9dc44c..4a7cb67 100644
+--- a/kernel/main.c
++++ b/kernel/main.c
+@@ -62,6 +62,7 @@ mainc(void)
+   cinit();
+   sti();           // enable inturrupts
+   userinit();      // first user process
++  initshmem();     // initialize shared memory
+   scheduler();     // start running processes
+ }
+ 
+diff --git a/kernel/mmu.h b/kernel/mmu.h
+index 3b6286f..e493def 100644
+--- a/kernel/mmu.h
++++ b/kernel/mmu.h
+@@ -121,7 +121,7 @@ struct segdesc {
+ 
+ #define PTXSHIFT	12		// offset of PTX in a linear address
+ #define PDXSHIFT	22		// offset of PDX in a linear address
+-
++#define NSHMEM          4               // maximum number of shared pages
+ #define PGROUNDUP(sz)  (((sz)+PGSIZE-1) & ~(PGSIZE-1))
+ #define PGROUNDDOWN(a) ((char*)((((unsigned int)(a)) & ~(PGSIZE-1))))
+ 
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 8e20984..9566949 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -68,6 +68,10 @@ found:
+   memset(p->context, 0, sizeof *p->context);
+   p->context->eip = (uint)forkret;
+ 
++  p->nshmem = 0;
++  int  i;
++  for (i = 0; i < NSHMEM; i++) p->shmem[i] = NULL;
++
+   return p;
+ }
+ 
+@@ -156,6 +160,12 @@ fork(void)
+   pid = np->pid;
+   np->state = RUNNABLE;
+   safestrcpy(np->name, proc->name, sizeof(proc->name));
++
++  np->nshmem = proc->nshmem;
++  for(i = 0; i < NSHMEM; ++i)
++    np->shmem[i] = proc->shmem[i];
++  forkupdate(np);
++
+   return pid;
+ }
+ 
+@@ -196,6 +206,8 @@ exit(void)
+     }
+   }
+ 
++  freeshmem(proc);
++
+   // Jump into the scheduler, never to return.
+   proc->state = ZOMBIE;
+   sched();
+diff --git a/kernel/proc.h b/kernel/proc.h
+index 7d64023..410ec02 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -74,6 +74,8 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++  int nshmem;                  // Number of shared memories
++  void *shmem[NSHMEM];          // Shared memory pointer array
+ };
+ 
+ // Process memory is laid out contiguously, low addresses first:
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index 28c8308..2dd8e0c 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -17,6 +17,7 @@
+ int
+ fetchint(struct proc *p, uint addr, int *ip)
+ {
++  if(p->parent != NULL && addr < 0x1000) return -1;
+   if(addr >= p->sz || addr+4 > p->sz)
+     return -1;
+   *ip = *(int*)(addr);
+@@ -30,7 +31,7 @@ int
+ fetchstr(struct proc *p, uint addr, char **pp)
+ {
+   char *s, *ep;
+-
++  if(p->parent != NULL && addr < 0x1000) return -1;
+   if(addr >= p->sz)
+     return -1;
+   *pp = (char*)addr;
+@@ -103,6 +104,8 @@ static int (*syscalls[])(void) = {
+ [SYS_wait]    sys_wait,
+ [SYS_write]   sys_write,
+ [SYS_uptime]  sys_uptime,
++[SYS_shmem_access] sys_shmem_access,
++[SYS_shmem_count] sys_shmem_count,
+ };
+ 
+ // Called on a syscall trap. Checks that the syscall number (passed via eax)
+diff --git a/kernel/sysfunc.h b/kernel/sysfunc.h
+index ee9dafd..17804dd 100644
+--- a/kernel/sysfunc.h
++++ b/kernel/sysfunc.h
+@@ -23,5 +23,6 @@ int sys_unlink(void);
+ int sys_wait(void);
+ int sys_write(void);
+ int sys_uptime(void);
+-
++int sys_shmem_access(void);
++int sys_shmem_count(void);
+ #endif // _SYSFUNC_H_
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 82b54f9..e2e1b27 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -88,3 +88,19 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++int
++sys_shmem_access(void)
++{
++  int page_number;
++  if(argint(0, &page_number) < 0) return -1;
++  return (int)shmem_access(page_number);
++}
++
++int
++sys_shmem_count(void)
++{
++  int page_number;
++  if(argint(0, &page_number) < 0) return -1;
++  return (int)shmem_count(page_number);
++}
+diff --git a/kernel/vm.c b/kernel/vm.c
+index 54d4bf4..8e76f6c 100644
+--- a/kernel/vm.c
++++ b/kernel/vm.c
+@@ -5,7 +5,8 @@
+ #include "mmu.h"
+ #include "proc.h"
+ #include "elf.h"
+-
++int shmem_counter[NSHMEM];
++void *shmem_addr[NSHMEM];
+ extern char data[];  // defined in data.S
+ 
+ static pde_t *kpgdir;  // for use in scheduler()
+@@ -79,7 +80,6 @@ mappages(pde_t *pgdir, void *la, uint size, uint pa, int perm)
+ {
+   char *a, *last;
+   pte_t *pte;
+-  
+   a = PGROUNDDOWN(la);
+   last = PGROUNDDOWN(la + size - 1);
+   for(;;){
+@@ -231,7 +231,7 @@ allocuvm(pde_t *pgdir, uint oldsz, uint newsz)
+   char *mem;
+   uint a;
+ 
+-  if(newsz > USERTOP)
++  if(newsz + PGSIZE * (1 + proc->nshmem) > USERTOP)
+     return 0;
+   if(newsz < oldsz)
+     return oldsz;
+@@ -286,7 +286,7 @@ freevm(pde_t *pgdir)
+ 
+   if(pgdir == 0)
+     panic("freevm: no pgdir");
+-  deallocuvm(pgdir, USERTOP, 0);
++  deallocuvm(pgdir, USERTOP - PGSIZE * NSHMEM, 0);
+   for(i = 0; i < NPDENTRIES; i++){
+     if(pgdir[i] & PTE_P)
+       kfree((char*)PTE_ADDR(pgdir[i]));
+@@ -306,7 +306,7 @@ copyuvm(pde_t *pgdir, uint sz)
+ 
+   if((d = setupkvm()) == 0)
+     return 0;
+-  for(i = 0; i < sz; i += PGSIZE){
++  for(i = PGSIZE; i < sz; i += PGSIZE){
+     if((pte = walkpgdir(pgdir, (void*)i, 0)) == 0)
+       panic("copyuvm: pte should exist");
+     if(!(*pte & PTE_P))
+@@ -364,3 +364,99 @@ copyout(pde_t *pgdir, uint va, void *p, uint len)
+   }
+   return 0;
+ }
++
++
++int 
++shmem_exist(int page_number){
++  if (proc->shmem[page_number]){
++	if (mappages(proc->pgdir, proc->shmem[page_number], PGSIZE, PADDR(shmem_addr[page_number]), PTE_W|PTE_U) < 0) 
++		return 0;
++	return 1;
++   }
++  return 2;
++}
++
++
++
++
++
++void*
++shmem_access(int page_number)
++{
++  if (page_number < 0 || page_number >= NSHMEM) return NULL;
++ 
++  //map exist case;
++  //j=0; mapping error return NULL
++  //j=1; share memory exists, return address
++  //j=2; share memory not exists, move on to allocate a new one 
++  int j;
++  j = shmem_exist(page_number);
++  
++  if( j == 0){ return NULL;}
++  else if( j == 1){return proc->shmem[page_number];}
++  else  {
++  	//share memory not exists, allocate new memory and build maps; 
++  	void *newSMEAddr = (void *)(USERTOP - (proc->nshmem + 1) * PGSIZE);
++ 
++  	if (proc->sz >= (int)newSMEAddr){
++ 		 return NULL;
++  	}
++  	else if((shmem_addr[page_number] = kalloc()) == 0) {
++  		return NULL;
++  	}
++  
++ 	else if(mappages(proc->pgdir, newSMEAddr, PGSIZE, PADDR(shmem_addr[page_number]), PTE_W | PTE_U) < 0){ 
++        	return NULL;
++  	}
++ 	
++	else{
++  		proc->nshmem++;
++  		++shmem_counter[page_number];
++  		proc->shmem[page_number] = newSMEAddr;
++ 
++		return newSMEAddr;
++  	}
++
++  }
++}
++
++
++
++int
++shmem_count(int page_number)
++{
++  if(page_number < 0 || page_number >= NSHMEM) return -1;
++  return shmem_counter[page_number];
++}
++
++void
++forkupdate(struct proc *p)
++{
++  int i;
++  for(i = 0; i < NSHMEM; ++i)
++    if(p->shmem[i]) ++shmem_counter[i];
++}
++
++void
++freeshmem(struct proc *p)
++{
++  int i;
++  for(i = 0; i < NSHMEM; ++i)
++    if(p->shmem[i]){
++      if(shmem_counter[i] == 1 && shmem_addr[i])
++        kfree((char*)shmem_addr[i]);
++      --shmem_counter[i];
++     // p->shmem[i] = NULL;
++    }
++ // p->nshmem = 0;   
++}
++
++void
++initshmem(void)
++{
++  int i;
++  for(i = 0; i < NSHMEM; ++i){
++    shmem_counter[i] = 0;
++    shmem_addr[i] = NULL;
++  }
++}
+diff --git a/team.txt b/team.txt
+new file mode 100644
+index 0000000..9d34c5b
+--- /dev/null
++++ b/team.txt
+@@ -0,0 +1,2 @@
++ydi6174
++zwl2367
+diff --git a/user/makefile.mk b/user/makefile.mk
+index 1441eb8..83c8207 100644
+--- a/user/makefile.mk
++++ b/user/makefile.mk
+@@ -16,7 +16,9 @@ USER_PROGS := \
+ 	tester\
+ 	usertests\
+ 	wc\
+-	zombie
++	zombie\
++        sharedmem_simpletests\
++        ta_tests_2_ec
+ 
+ USER_PROGS := $(addprefix user/, $(USER_PROGS))
+ 
+@@ -73,7 +75,7 @@ USER_LDFLAGS += --omagic
+ USER_LDFLAGS += --entry=main
+ 
+ # location in memory where the program will be loaded
+-USER_LDFLAGS += --section-start=.text=0x0
++USER_LDFLAGS += --section-start=.text=0x1000
+ 
+ user/bin:
+ 	mkdir -p user/bin
+diff --git a/user/user.h b/user/user.h
+index 2b68ee0..d01c92d 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -25,6 +25,8 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++void* shmem_access(int);
++int shmem_count(int);
+ 
+ // user library functions (ulib.c)
+ int stat(char*, struct stat*);
+diff --git a/user/usys.S b/user/usys.S
+index 8bfd8a1..5bfed04 100644
+--- a/user/usys.S
++++ b/user/usys.S
+@@ -29,3 +29,5 @@ SYSCALL(getpid)
+ SYSCALL(sbrk)
+ SYSCALL(sleep)
+ SYSCALL(uptime)
++SYSCALL(shmem_access)
++SYSCALL(shmem_count)
