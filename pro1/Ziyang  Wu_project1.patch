@@ -1,0 +1,236 @@
+diff --git a/include/ProcessInfo.h b/include/ProcessInfo.h
+new file mode 100644
+index 0000000..04fbe1a
+--- /dev/null
++++ b/include/ProcessInfo.h
+@@ -0,0 +1,13 @@
++#ifndef _PROCESSINFO_H_
++#define _PROCESSINFO_H_
++#include "types.h"
++
++struct ProcessInfo {
++   int pid; // process id
++   int ppid; // parent pid
++   int state; // state
++   uint sz; // size in bytes
++   char name[16]; // name of process
++ };
++
++#endif //_PROCESSINFO_H_    
+\ No newline at end of file
+diff --git a/include/syscall.h b/include/syscall.h
+index c55cec2..c56b46f 100644
+--- a/include/syscall.h
++++ b/include/syscall.h
+@@ -23,5 +23,6 @@
+ #define SYS_sbrk   19
+ #define SYS_sleep  20
+ #define SYS_uptime 21
++#define SYS_getprocs 22
+ 
+ #endif // _SYSCALL_H_
+diff --git a/kernel/defs.h b/kernel/defs.h
+index c12f8ff..762d619 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -9,6 +9,7 @@ struct pipe;
+ struct proc;
+ struct spinlock;
+ struct stat;
++struct ProcessInfo;
+ 
+ // bio.c
+ void            binit(void);
+@@ -100,6 +101,7 @@ void            exit(void);
+ int             fork(void);
+ int             growproc(int);
+ int             kill(int);
++int 			getprocs(struct ProcessInfo*);
+ void            pinit(void);
+ void            procdump(void);
+ void            scheduler(void) __attribute__((noreturn));
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 8e20984..e4a9ac4 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -5,6 +5,7 @@
+ #include "x86.h"
+ #include "proc.h"
+ #include "spinlock.h"
++#include "ProcessInfo.h"
+ 
+ struct {
+   struct spinlock lock;
+@@ -407,6 +408,32 @@ kill(int pid)
+   return -1;
+ }
+ 
++
++//-------------------------********************----------------------
++int 
++getprocs(struct ProcessInfo processInfoTable[])
++{
++  struct proc *p;
++  int counter = 0;
++  int i = 0;
++  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++)
++    if(p->state == UNUSED) continue;
++    else
++    {
++      processInfoTable[i].pid = p->pid;
++      if (i == 0) 
++        processInfoTable[i].ppid = -1;
++      else 
++        processInfoTable[i].ppid = p->parent->pid;
++      processInfoTable[i].state = p->state;
++      processInfoTable[i].sz = p->sz;
++      safestrcpy(processInfoTable[i].name, p->name, sizeof(p->name));
++      i++;
++      counter++;
++    }
++  return counter;
++}
++
+ // Print a process listing to console.  For debugging.
+ // Runs when user types ^P on console.
+ // No lock to avoid wedging a stuck machine further.
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index 28c8308..81a89d2 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -90,6 +90,7 @@ static int (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+ [SYS_fstat]   sys_fstat,
+ [SYS_getpid]  sys_getpid,
++[SYS_getprocs] sys_getprocs, 
+ [SYS_kill]    sys_kill,
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+diff --git a/kernel/sysfunc.h b/kernel/sysfunc.h
+index ee9dafd..c75bf98 100644
+--- a/kernel/sysfunc.h
++++ b/kernel/sysfunc.h
+@@ -1,6 +1,8 @@
+ #ifndef _SYSFUNC_H_
+ #define _SYSFUNC_H_
+ 
++#include "ProcessInfo.h"
++
+ // System call handlers
+ int sys_chdir(void);
+ int sys_close(void);
+@@ -23,5 +25,6 @@ int sys_unlink(void);
+ int sys_wait(void);
+ int sys_write(void);
+ int sys_uptime(void);
++int sys_getprocs(void);
+ 
+ #endif // _SYSFUNC_H_
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 82b54f9..9bc7b25 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -5,6 +5,7 @@
+ #include "mmu.h"
+ #include "proc.h"
+ #include "sysfunc.h"
++#include "ProcessInfo.h"
+ 
+ int
+ sys_fork(void)
+@@ -41,6 +42,19 @@ sys_getpid(void)
+   return proc->pid;
+ }
+ 
++//-----------------------------*************-----------
++int 
++sys_getprocs(void)
++{
++  int t;
++  struct ProcessInfo *p;
++
++  if(argint(0, &t) < 0)
++    return -1;
++  p = (struct ProcessInfo *)t;
++  return getprocs(p);
++}
++
+ int
+ sys_sbrk(void)
+ {
+diff --git a/user/makefile.mk b/user/makefile.mk
+index 1441eb8..023c371 100644
+--- a/user/makefile.mk
++++ b/user/makefile.mk
+@@ -7,6 +7,7 @@ USER_PROGS := \
+ 	grep\
+ 	init\
+ 	kill\
++	ps\
+ 	ln\
+ 	ls\
+ 	mkdir\
+diff --git a/user/ps.c b/user/ps.c
+new file mode 100644
+index 0000000..e6a6a94
+--- /dev/null
++++ b/user/ps.c
+@@ -0,0 +1,29 @@
++#include "types.h"
++#include "stat.h"
++#include "user.h"
++#include "ProcessInfo.h"
++#include "param.h"
++
++
++int
++main(int argc, char *argv[])
++{
++	struct ProcessInfo processInfoTable[NPROC];
++	int i;
++	int num = 0;
++	char *s[] = {"UNUSED","EMBRYO","SLEEPING","RUNNABLE","RUNNING","ZOMBIE"};
++
++
++	if(argc < 1){
++		printf(1, "usage: type 'ps' to list current processes...\n");
++		exit();
++	}
++	num = getprocs(processInfoTable);
++
++	for (i = 0; i < num; ++i)
++	{
++		printf(1,"%d %d %s %d %s \n",processInfoTable[i].pid, processInfoTable[i].ppid,
++		s[processInfoTable[i].state], processInfoTable[i].sz, processInfoTable[i].name);
++	}
++	exit();
++}
+\ No newline at end of file
+diff --git a/user/user.h b/user/user.h
+index 2b68ee0..daafc71 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -1,5 +1,6 @@
+ #ifndef _USER_H_
+ #define _USER_H_
++#include "ProcessInfo.h"
+ 
+ struct stat;
+ 
+@@ -22,6 +23,7 @@ int mkdir(char*);
+ int chdir(char*);
+ int dup(int);
+ int getpid(void);
++int getprocs(struct ProcessInfo*);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
+diff --git a/user/usys.S b/user/usys.S
+index 8bfd8a1..f89931d 100644
+--- a/user/usys.S
++++ b/user/usys.S
+@@ -29,3 +29,4 @@ SYSCALL(getpid)
+ SYSCALL(sbrk)
+ SYSCALL(sleep)
+ SYSCALL(uptime)
++SYSCALL(getprocs)

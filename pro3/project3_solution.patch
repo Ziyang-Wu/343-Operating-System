@@ -1,0 +1,1366 @@
+diff --git a/include/syscall.h b/include/syscall.h
+index c55cec2..01626a5 100644
+--- a/include/syscall.h
++++ b/include/syscall.h
+@@ -23,5 +23,9 @@
+ #define SYS_sbrk   19
+ #define SYS_sleep  20
+ #define SYS_uptime 21
+-
++#define SYS_clone  22
++#define SYS_join   23
++#define SYS_getstack 24
++#define SYS_cv_wait 25
++#define SYS_cv_signal 26
+ #endif // _SYSCALL_H_
+diff --git a/include/types.h b/include/types.h
+index cfcdb4a..a5761ab 100644
+--- a/include/types.h
++++ b/include/types.h
+@@ -7,6 +7,9 @@ typedef unsigned int   uint;
+ typedef unsigned short ushort;
+ typedef unsigned char  uchar;
+ typedef uint pde_t;
++typedef uint lock_t;
++typedef uint cond_t;
++
+ #ifndef NULL
+ #define NULL (0)
+ #endif
+diff --git a/kernel/defs.h b/kernel/defs.h
+index c12f8ff..2e328f1 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -109,8 +109,14 @@ void            userinit(void);
+ int             wait(void);
+ void            wakeup(void*);
+ void            yield(void);
++int             clone(void(*fcn)(void*), void* arg, void* stack);
++int 		    join(int pid);
++int             getstack(int pid);
++void            cv_wait(cond_t* conditionVariable, lock_t* lock);
++void            cv_signal(cond_t* conditionVariable);
+ 
+ // swtch.S
++
+ void            swtch(struct context**, struct context*);
+ 
+ // spinlock.c
+@@ -121,6 +127,8 @@ void            initlock(struct spinlock*, char*);
+ void            release(struct spinlock*);
+ void            pushcli(void);
+ void            popcli(void);
++void			get_thread_lock(lock_t *lk);
++void			release_thread_lock(lock_t *lk);
+ 
+ // string.c
+ int             memcmp(const void*, const void*, uint);
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 8e20984..136b4e7 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -63,6 +63,8 @@ found:
+   sp -= 4;
+   *(uint*)sp = (uint)trapret;
+ 
++  p->isThread = 0;          //initialize isThread
++
+   sp -= sizeof *p->context;
+   p->context = (struct context*)sp;
+   memset(p->context, 0, sizeof *p->context);
+@@ -109,6 +111,10 @@ growproc(int n)
+   uint sz;
+   
+   sz = proc->sz;
++  if (proc->isThread == 1){
++    acquire(&ptable.lock);  //Ensure threads grow the address space without causing race-related errors.
++  }
++  
+   if(n > 0){
+     if((sz = allocuvm(proc->pgdir, sz, sz + n)) == 0)
+       return -1;
+@@ -117,6 +123,9 @@ growproc(int n)
+       return -1;
+   }
+   proc->sz = sz;
++  if(proc->isThread == 1){
++        release(&ptable.lock);
++      }
+   switchuvm(proc);
+   return 0;
+ }
+@@ -159,6 +168,103 @@ fork(void)
+   return pid;
+ }
+ 
++//***************************clone and join changes begin ******************************
++int 
++clone(void(*fcn)(void*), void* arg, void* stack)
++{
++  int tid, i;
++  struct proc *nt, *p;
++
++  if ((uint) stack % PGSIZE != 0) return -1;  //check if the stack is page-aligned
++
++  if ((nt = allocproc()) == 0)
++    return -1;
++  nt->pgdir = proc->pgdir;     //share memory with parent
++  
++  // get a copy of the parent's file descriptors
++  nt->sz = proc->sz;
++  nt->isThread = 1;
++  nt->ustack = (char*)stack;
++  *nt->tf = *proc->tf;
++  
++  uint ustack[2];
++  uint sp = (uint)stack + PGSIZE;
++  ustack[0] = 0xffffffff;     // fake return address
++  ustack[1] = (uint)arg;
++  sp -= 8;                    
++  if(copyout(nt->pgdir, sp, ustack, 8) < 0)
++      return -1;              // failed to copy bottom of stack into new task
++  nt->tf->eip = (uint)fcn;
++  nt->tf->esp = sp;
++  switchuvm(nt);
++
++  for(p = proc; p->isThread==1; p = p->parent);
++  nt->parent = p;           //set thread's parent to point to main 
++
++  
++  nt->tf->eax = 0;
++
++  for(i = 0; i < NOFILE; i++)
++    if(proc->ofile[i])
++      nt->ofile[i] = filedup(proc->ofile[i]);
++  nt->cwd = idup(proc->cwd);
++  nt->state = RUNNABLE;
++  safestrcpy(nt->name, proc->name, sizeof(proc->name));
++  tid = nt->pid;
++  return tid;
++
++}
++
++int 
++join(int pid)
++{
++  struct proc *p;
++  int havekids;
++  
++  acquire(&ptable.lock);
++  for(;;){
++    havekids = 0;
++    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++      if(p->pid == pid){                  //wait for the thread specified by pid
++          if(p->isThread == 0){         // if join on a process, return -1
++            release(&ptable.lock);
++            return -1;
++          }
++          if(p->isThread == 1 && proc->isThread == 0 && p->parent != proc){
++            release(&ptable.lock);       //if proc is a process but not the parent of the thread with pid
++            return -1;
++          }
++          if(p->isThread ==1 && proc->isThread == 1 && p->parent != proc->parent){
++            release(&ptable.lock);     //if proc is a thread and they are not in the same group
++            return -1;
++          }
++          
++          havekids = 1;
++          if(p->state == ZOMBIE){
++            kfree(p->kstack);
++            p->kstack = 0;
++            p->state = UNUSED;
++            p->pid = 0;
++            p->parent = 0;
++            p->name[0] = 0;
++            p->killed = 0;
++            release(&ptable.lock);
++            return pid;
++      }
++    }
++  }
++    // No point waiting if we don't have any children.
++    if(!havekids || proc->killed){
++      release(&ptable.lock);
++      return -1;
++    }
++
++      // Wait for children to exit.  (See wakeup1 call in proc_exit.)
++    sleep(proc, &ptable.lock);  //DOC: wait-sleep
++  
++  }
++}
++
+ // Exit the current process.  Does not return.
+ // An exited process remains in the zombie state
+ // until its parent calls wait() to find out it exited.
+@@ -189,13 +295,26 @@ exit(void)
+ 
+   // Pass abandoned children to init.
+   for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+-    if(p->parent == proc){
++    if(p->parent == proc && p->isThread == 0){
++      p->parent = initproc;
++      if(p->state == ZOMBIE)
++        wakeup1(initproc);
++    }
++    if(p->parent == proc && p->isThread == 1){
++      p->killed = 1;
++      // Wake process from sleep if necessary.
++      if(p->state == SLEEPING)
++        p->state = RUNNABLE;
+       p->parent = initproc;
+       if(p->state == ZOMBIE)
+         wakeup1(initproc);
++      //clean up
++      kfree(p->kstack);
++      p->kstack = 0;
++      p->state = UNUSED;
+     }
+   }
+-
++  
+   // Jump into the scheduler, never to return.
+   proc->state = ZOMBIE;
+   sched();
+@@ -215,7 +334,7 @@ wait(void)
+     // Scan through table looking for zombie children.
+     havekids = 0;
+     for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+-      if(p->parent != proc)
++      if(p->parent != proc || p->isThread == 1)  //side effects: wait only wait for child processes, not child threads
+         continue;
+       havekids = 1;
+       if(p->state == ZOMBIE){
+@@ -443,4 +562,72 @@ procdump(void)
+   }
+ }
+ 
++//************find ustack for thread specified in thread_join**************
++int
++getstack(int pid)
++{
++  struct proc *p;
++  int havekids;
++
++  acquire(&ptable.lock);
++  for(;;){
++    havekids = 0;
++    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++      if(p->isThread == 0 || p->pid != pid) 
++        continue;
++      havekids = 1;
++      if(p->state == ZOMBIE){
++        release(&ptable.lock);
++        return (int)p->ustack;
++      }
++    }
++    // No point waiting if we don't have any children.
++   if(!havekids || proc->killed){
++     release(&ptable.lock);
++     return -1;          
++     }
++    sleep(proc, &ptable.lock); 
++     }
++}
++
++
++//*******************changes for conditional variables***************
++
++void
++cv_wait(cond_t* conditionVariable, lock_t* lock)
++{
++
++    if(proc == 0) panic("sleep");
++    
++    if(lock == 0) panic("sleep without lock");
++    
++    if(lock != (lock_t*)&ptable.lock){
++        acquire(&ptable.lock);
++        release_thread_lock(lock);       //function for lock_t type, see definition in spinlock.c
++    }
++    
++    proc->chan = (void *)conditionVariable;
++    proc->state = SLEEPING;
++    sched();
++    
++    proc->chan = 0;
++    
++    if(lock != (lock_t*)&ptable.lock){
++        release(&ptable.lock);
++        get_thread_lock(lock);   //function for lock_t type, see definition in spinlock.c
++    }
++}
++
++
++
++
++void
++cv_signal(cond_t* conditionVariable)
++{
++    struct proc *p;
++    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++)
++        if (p->state == SLEEPING && p->chan == (void*)conditionVariable)
++            p->state = RUNNABLE;
++}
++
+ 
+diff --git a/kernel/proc.h b/kernel/proc.h
+index 7d64023..2dec008 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -74,6 +74,8 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++  int isThread;                // Flag indicating whether this entry is a child thread or the main thread
++  char *ustack;                // Bottom of user stack for this process
+ };
+ 
+ // Process memory is laid out contiguously, low addresses first:
+diff --git a/kernel/spinlock.c b/kernel/spinlock.c
+index e668598..18c64f3 100644
+--- a/kernel/spinlock.c
++++ b/kernel/spinlock.c
+@@ -62,6 +62,22 @@ release(struct spinlock *lk)
+   popcli();
+ }
+ 
++//*****************add new lock function for loct_t lock**************
++
++void
++get_thread_lock(lock_t *lk)
++{
++  while(xchg(lk,1) != 0);
++}
++
++void
++release_thread_lock(lock_t *lk)
++{
++  xchg(lk,0);
++}
++
++//*******************new lock end*****************
++
+ // Record the current call stack in pcs[] by following the %ebp chain.
+ void
+ getcallerpcs(void *v, uint pcs[])
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index 28c8308..58fae97 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -103,6 +103,11 @@ static int (*syscalls[])(void) = {
+ [SYS_wait]    sys_wait,
+ [SYS_write]   sys_write,
+ [SYS_uptime]  sys_uptime,
++[SYS_clone]   sys_clone,
++[SYS_join]    sys_join,
++[SYS_getstack] sys_getstack,
++[SYS_cv_wait] sys_cv_wait,
++[SYS_cv_signal] sys_cv_signal,
+ };
+ 
+ // Called on a syscall trap. Checks that the syscall number (passed via eax)
+diff --git a/kernel/sysfunc.h b/kernel/sysfunc.h
+index ee9dafd..f8d1f6b 100644
+--- a/kernel/sysfunc.h
++++ b/kernel/sysfunc.h
+@@ -23,5 +23,10 @@ int sys_unlink(void);
+ int sys_wait(void);
+ int sys_write(void);
+ int sys_uptime(void);
++int sys_clone(void);
++int sys_join(void);
++int sys_getstack(void);
++int sys_cv_wait(void);
++int sys_cv_signal(void);
+ 
+ #endif // _SYSFUNC_H_
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 82b54f9..667f2ca 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -24,6 +24,65 @@ sys_wait(void)
+ {
+   return wait();
+ }
++//************************ clone and join changes begin ***************
++int 
++sys_clone(void)
++{
++  void (*fcn)(void*);
++  void *arg;
++  void *stack;
++  if (argptr(0, (char**)&fcn, 4) < 0) return -1;
++  if (argptr(1, (char**)&arg, 4) < 0) return -1;
++  if (argptr(2, (char**)&stack, 2 * PGSIZE) < 0) return -1;
++  return clone(fcn, arg, stack);
++}
++
++int
++sys_join(void)
++{
++  int pid;
++  if(argint(0, &pid) < 0)
++    return -1;
++  return join(pid);
++}
++
++int
++
++sys_getstack(void)
++{
++  int pid;
++  if (argint(0,&pid) < 0 ){
++  return -1;
++
++  }
++  return getstack(pid);
++}
++
++int
++sys_cv_wait(void)
++{
++
++    cond_t* conditionVariable;
++    lock_t* lock;
++    if (argptr(0, (char**)&conditionVariable, 4) < 0) return -1;
++    if (argptr(1, (char**)&lock, 4) < 0) return -1;
++    cv_wait(conditionVariable, lock);
++    return 0;
++}
++
++
++int
++sys_cv_signal(void)
++{
++
++    cond_t* conditionVariable;
++    if (argptr(0, (char**)&conditionVariable, 4) < 0) return -1;
++    cv_signal(conditionVariable);
++    return 0;
++}
++
++
++//***********************changes end *****************
+ 
+ int
+ sys_kill(void)
+diff --git a/team.txt b/team.txt
+new file mode 100644
+index 0000000..d171436
+--- /dev/null
++++ b/team.txt
+@@ -0,0 +1,3 @@
++ylf9397
++zwl2367
++
+diff --git a/user/badclone.c b/user/badclone.c
+new file mode 100644
+index 0000000..81f0071
+--- /dev/null
++++ b/user/badclone.c
+@@ -0,0 +1,50 @@
++/* When passing a non page-aligned stack to clone, clone should return -1. */
++#include "types.h"
++#include "user.h"
++
++#undef NULL
++#define NULL ((void*)0)
++
++#define PGSIZE (4096)
++
++int ppid;
++
++#define assert(x) if (x) {} else { \
++   printf(1, "%s: %d ", __FILE__, __LINE__); \
++   printf(1, "assert failed (%s)\n", # x); \
++   printf(1, "TEST FAILED\n"); \
++   kill(ppid); \
++   exit(); \
++}
++
++void worker(void *arg_ptr);
++
++int
++main(int argc, char *argv[])
++{
++   ppid = getpid();
++   void *stack = malloc(PGSIZE*2);
++   assert(stack != NULL);
++   if((uint)stack % PGSIZE == 0)
++     stack += 4;
++
++   assert(clone(worker, 0, stack) == -1);  // when stack is not page-aligned, clone should fail
++
++   stack = sbrk(0);
++   if((uint)stack % PGSIZE){
++     stack = stack + (PGSIZE - (uint)stack % PGSIZE);
++   }
++   sbrk( ((uint)stack - (uint)sbrk(0)) + PGSIZE/2 );
++   assert((uint)stack % PGSIZE == 0);
++   assert((uint)sbrk(0) - (uint)stack == PGSIZE/2);
++
++   assert(clone(worker, 0, stack) == -1);
++
++   printf(1, "TEST PASSED\n");
++   exit();
++}
++
++void
++worker(void *arg_ptr) {
++   exit();
++}
+diff --git a/user/clone.c b/user/clone.c
+new file mode 100644
+index 0000000..80d8e6b
+--- /dev/null
++++ b/user/clone.c
+@@ -0,0 +1,48 @@
++/* Call clone and spin until child thread has changed global variable.  Verifies that address space is shared. */
++#include "types.h"
++#include "user.h"
++
++#undef NULL
++#define NULL ((void*)0)
++
++int ppid;
++#define PGSIZE (4096)
++
++volatile int global = 1;
++
++#define assert(x) if (x) {} else { \
++   printf(1, "%s: %d ", __FILE__, __LINE__); \
++   printf(1, "assert failed (%s)\n", # x); \
++   printf(1, "TEST FAILED\n"); \
++   kill(ppid); \
++   exit(); \
++}
++
++void worker(void *arg_ptr);
++
++int
++main(int argc, char *argv[])
++{
++   ppid = getpid();
++   void *stack = malloc(PGSIZE*2);
++   assert(stack != NULL);
++   if((uint)stack % PGSIZE) {
++     stack = stack + (PGSIZE - (uint)stack % PGSIZE);
++   }
++
++   int clone_pid = clone(worker, 0, stack);
++   assert(clone_pid > 0);
++   while(global != 5) {
++      ; // wait for thread worker to change global
++   }
++   printf(1, "global: %d\n", global);
++   printf(1, "TEST PASSED\n");
++   exit();
++}
++
++void
++worker(void *arg_ptr) {
++   assert(global == 1);
++   global = 5;
++   exit();
++}
+diff --git a/user/join.c b/user/join.c
+new file mode 100644
+index 0000000..0e7ac55
+--- /dev/null
++++ b/user/join.c
+@@ -0,0 +1,53 @@
++/* Call clone to create a new thread.  Call join to wait for that new thread to complete.  join should return the pid of the completed thread and the changes made by the thread should now be seen by the original process. */
++#include "types.h"
++#include "user.h"
++
++#undef NULL
++#define NULL ((void*)0)
++
++#define PGSIZE (4096)
++
++int ppid;
++int global = 1;
++
++#define assert(x) if (x) {} else { \
++   printf(1, "%s: %d ", __FILE__, __LINE__); \
++   printf(1, "assert failed (%s)\n", # x); \
++   printf(1, "TEST FAILED\n"); \
++   kill(ppid); \
++   exit(); \
++}
++
++void worker(void *arg_ptr);
++
++int
++main(int argc, char *argv[])
++{
++   ppid = getpid();
++
++   void *stack = malloc(PGSIZE*2);
++   assert(stack != NULL);
++   if((uint)stack % PGSIZE)
++     stack = stack + (PGSIZE - (uint)stack % PGSIZE);
++
++   int arg = 42;
++   int new_thread_pid = clone(worker, &arg, stack);
++   assert(new_thread_pid > 0);
++
++   int join_pid = join(new_thread_pid);
++   assert(join_pid == new_thread_pid);
++   assert(global == 2);
++
++   printf(1, "TEST PASSED\n");
++   exit();
++}
++
++void
++worker(void *arg_ptr) {
++   int arg = *(int*)arg_ptr;
++   assert(arg == 42);
++   assert(global == 1);
++   global++;
++   exit();
++}
++
+diff --git a/user/makefile.mk b/user/makefile.mk
+index 1441eb8..852b25a 100644
+--- a/user/makefile.mk
++++ b/user/makefile.mk
+@@ -9,20 +9,38 @@ USER_PROGS := \
+ 	kill\
+ 	ln\
+ 	ls\
++	clone\
++	badclone\
++	join\
+ 	mkdir\
+ 	rm\
+ 	sh\
+ 	stressfs\
+ 	tester\
+ 	usertests\
++	clone2\
++	clone3\
++	join2\
++	thread\
++	thread2\
++	join3\
++	join4\
+ 	wc\
+-	zombie
++	zombie\
++	multi\
++	race\
++	cond\
++	cond2\
++	cond3\
++	size\
++	stack\
+ 
+ USER_PROGS := $(addprefix user/, $(USER_PROGS))
+ 
+ # user library files
+ USER_LIBS := \
+ 	ulib.o\
++	uthreadlib.o\
+ 	usys.o\
+ 	printf.o\
+ 	umalloc.o
+diff --git a/user/user.h b/user/user.h
+index 2b68ee0..05c9ac3 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -25,6 +25,12 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int clone(void(*fcn)(void*), void* arg, void* stack);
++int join(int pid);
++int getstack(int pid);
++void cv_wait(cond_t* conditionVariable, lock_t* lock);
++void cv_signal(cond_t* conditionVariable);
++
+ 
+ // user library functions (ulib.c)
+ int stat(char*, struct stat*);
+@@ -39,6 +45,12 @@ void* memset(void*, int, uint);
+ void* malloc(uint);
+ void free(void*);
+ int atoi(const char*);
++//extra requirement function signatures
++int thread_create(void (*start_routine)(void*), void* arg);
++int thread_join(int pid);
++void lock_acquire(lock_t* lock);
++void lock_release(lock_t* lock);
++void lock_init(lock_t* lock);
+ 
+-#endif // _USER_H_
+ 
++#endif // _USER_H_
+diff --git a/user/usertests.c b/user/usertests.c
+index 2586378..0478524 100644
+--- a/user/usertests.c
++++ b/user/usertests.c
+@@ -1,3 +1,4 @@
++/* user regression tests */
+ #include "types.h"
+ #include "stat.h"
+ #include "user.h"
+@@ -11,7 +12,7 @@
+ 
+ char buf[2048];
+ char name[3];
+-char *echoargv[] = { "echo", "ALL", "TESTS", "PASSED", 0 };
++char *echoargv[] = { "echo", "TEST", "PASSED", 0 };
+ int stdout = 1;
+ 
+ // simple file system tests
+@@ -21,7 +22,7 @@ opentest(void)
+ {
+   int fd;
+ 
+-  printf(stdout, "open test\n");
++  printf(stdout, "open test: ");
+   fd = open("echo", 0);
+   if(fd < 0){
+     printf(stdout, "open echo failed!\n");
+@@ -33,7 +34,7 @@ opentest(void)
+     printf(stdout, "open doesnotexist succeeded!\n");
+     exit();
+   }
+-  printf(stdout, "open test ok\n");
++  printf(stdout, "ok\n");
+ }
+ 
+ void
+@@ -42,10 +43,10 @@ writetest(void)
+   int fd;
+   int i;
+ 
+-  printf(stdout, "small file test\n");
++  printf(stdout, "small file test: ");
+   fd = open("small", O_CREATE|O_RDWR);
+   if(fd >= 0){
+-    printf(stdout, "creat small succeeded; ok\n");
++    //printf(stdout, "creat small succeeded; ok\n");
+   } else {
+     printf(stdout, "error: creat small failed!\n");
+     exit();
+@@ -60,18 +61,18 @@ writetest(void)
+       exit();
+     }
+   }
+-  printf(stdout, "writes ok\n");
++  //printf(stdout, "writes ok\n");
+   close(fd);
+   fd = open("small", O_RDONLY);
+   if(fd >= 0){
+-    printf(stdout, "open small succeeded ok\n");
++    //printf(stdout, "open small succeeded ok\n");
+   } else {
+     printf(stdout, "error: open small failed!\n");
+     exit();
+   }
+   i = read(fd, buf, 2000);
+   if(i == 2000){
+-    printf(stdout, "read succeeded ok\n");
++    //printf(stdout, "read succeeded ok\n");
+   } else {
+     printf(stdout, "read failed\n");
+     exit();
+@@ -82,7 +83,7 @@ writetest(void)
+     printf(stdout, "unlink small failed\n");
+     exit();
+   }
+-  printf(stdout, "small file test ok\n");
++  printf(stdout, "ok\n");
+ }
+ 
+ void
+@@ -90,7 +91,7 @@ writetest1(void)
+ {
+   int i, fd, n;
+ 
+-  printf(stdout, "big files test\n");
++  printf(stdout, "big files test: ");
+ 
+   fd = open("big", O_CREATE|O_RDWR);
+   if(fd < 0){
+@@ -139,7 +140,7 @@ writetest1(void)
+     printf(stdout, "unlink big failed\n");
+     exit();
+   }
+-  printf(stdout, "big files ok\n");
++  printf(stdout, "ok\n");
+ }
+ 
+ void
+@@ -147,7 +148,7 @@ createtest(void)
+ {
+   int i, fd;
+ 
+-  printf(stdout, "many creates, followed by unlink test\n");
++  printf(stdout, "create test: ");
+ 
+   name[0] = 'a';
+   name[2] = '\0';
+@@ -162,12 +163,12 @@ createtest(void)
+     name[1] = '0' + i;
+     unlink(name);
+   }
+-  printf(stdout, "many creates, followed by unlink; ok\n");
++  printf(stdout, "ok\n");
+ }
+ 
+ void dirtest(void)
+ {
+-  printf(stdout, "mkdir test\n");
++  printf(stdout, "mkdir test: ");
+ 
+   if(mkdir("dir0") < 0){
+     printf(stdout, "mkdir failed\n");
+@@ -188,7 +189,7 @@ void dirtest(void)
+     printf(stdout, "unlink dir0 failed\n");
+     exit();
+   }
+-  printf(stdout, "mkdir test\n");
++  printf(stdout, "ok\n");
+ }
+ 
+ void
+@@ -209,6 +210,7 @@ pipe1(void)
+   int fds[2], pid;
+   int seq, i, n, cc, total;
+ 
++  printf(1, "pipe1: ");
+   if(pipe(fds) != 0){
+     printf(1, "pipe() failed\n");
+     exit();
+@@ -250,7 +252,7 @@ pipe1(void)
+     printf(1, "fork() failed\n");
+     exit();
+   }
+-  printf(1, "pipe1 ok\n");
++  printf(1, "ok\n");
+ }
+ 
+ // meant to be run w/ at most two CPUs
+@@ -296,7 +298,7 @@ preempt(void)
+   wait();
+   wait();
+   wait();
+-  printf(1, "preempt ok\n");
++  printf(1, "ok\n");
+ }
+ 
+ // try to find any races between exit and wait
+@@ -305,6 +307,7 @@ exitwait(void)
+ {
+   int i, pid;
+ 
++  printf(1, "exitwait: ");
+   for(i = 0; i < 100; i++){
+     pid = fork();
+     if(pid < 0){
+@@ -320,7 +323,7 @@ exitwait(void)
+       exit();
+     }
+   }
+-  printf(1, "exitwait ok\n");
++  printf(1, "ok\n");
+ }
+ 
+ void
+@@ -329,7 +332,7 @@ mem(void)
+   void *m1, *m2;
+   int pid, ppid;
+ 
+-  printf(1, "mem test\n");
++  printf(1, "mem test: ");
+   ppid = getpid();
+   if((pid = fork()) == 0){
+     m1 = 0;
+@@ -349,7 +352,7 @@ mem(void)
+       exit();
+     }
+     free(m1);
+-    printf(1, "mem ok\n");
++    printf(1, "ok\n");
+     exit();
+   } else {
+     wait();
+@@ -366,6 +369,7 @@ sharedfd(void)
+   int fd, pid, i, n, nc, np;
+   char buf[10];
+ 
++  printf(1, "sharedfd: ");
+   unlink("sharedfd");
+   fd = open("sharedfd", O_CREATE|O_RDWR);
+   if(fd < 0){
+@@ -374,7 +378,7 @@ sharedfd(void)
+   }
+   pid = fork();
+   memset(buf, pid==0?'c':'p', sizeof(buf));
+-  for(i = 0; i < 1000; i++){
++  for(i = 0; i < 100; i++){
+     if(write(fd, buf, sizeof(buf)) != sizeof(buf)){
+       printf(1, "fstests: write sharedfd failed\n");
+       break;
+@@ -401,8 +405,8 @@ sharedfd(void)
+   }
+   close(fd);
+   unlink("sharedfd");
+-  if(nc == 10000 && np == 10000)
+-    printf(1, "sharedfd ok\n");
++  if(nc == 1000 && np == 1000)
++    printf(1, "ok\n");
+   else
+     printf(1, "sharedfd oops %d %d\n", nc, np);
+ }
+@@ -415,7 +419,7 @@ twofiles(void)
+   int fd, pid, i, j, n, total;
+   char *fname;
+ 
+-  printf(1, "twofiles test\n");
++  printf(1, "twofiles test: ");
+ 
+   unlink("f1");
+   unlink("f2");
+@@ -468,7 +472,7 @@ twofiles(void)
+   unlink("f1");
+   unlink("f2");
+ 
+-  printf(1, "twofiles ok\n");
++  printf(1, "ok\n");
+ }
+ 
+ // two processes create and delete different files in same directory
+@@ -479,7 +483,7 @@ createdelete(void)
+   int pid, i, fd;
+   char name[32];
+ 
+-  printf(1, "createdelete test\n");
++  printf(1, "createdelete test: ");
+   pid = fork();
+   if(pid < 0){
+     printf(1, "fork failed\n");
+@@ -546,7 +550,7 @@ createdelete(void)
+     unlink(name);
+   }
+ 
+-  printf(1, "createdelete ok\n");
++  printf(1, "ok\n");
+ }
+ 
+ // can I unlink a file and still read it?
+@@ -555,7 +559,7 @@ unlinkread(void)
+ {
+   int fd, fd1;
+ 
+-  printf(1, "unlinkread test\n");
++  printf(1, "unlinkread test: ");
+   fd = open("unlinkread", O_CREATE | O_RDWR);
+   if(fd < 0){
+     printf(1, "create unlinkread failed\n");
+@@ -592,7 +596,7 @@ unlinkread(void)
+   }
+   close(fd);
+   unlink("unlinkread");
+-  printf(1, "unlinkread ok\n");
++  printf(1, "ok\n");
+ }
+ 
+ void
+@@ -600,7 +604,7 @@ linktest(void)
+ {
+   int fd;
+ 
+-  printf(1, "linktest\n");
++  printf(1, "linktest: ");
+ 
+   unlink("lf1");
+   unlink("lf2");
+@@ -654,7 +658,7 @@ linktest(void)
+     exit();
+   }
+ 
+-  printf(1, "linktest ok\n");
++  printf(1, "ok\n");
+ }
+ 
+ // test concurrent create and unlink of the same file
+@@ -669,7 +673,7 @@ concreate(void)
+     char name[14];
+   } de;
+ 
+-  printf(1, "concreate test\n");
++  printf(1, "concreate test: ");
+   file[0] = 'C';
+   file[2] = '\0';
+   for(i = 0; i < 40; i++){
+@@ -741,7 +745,7 @@ concreate(void)
+       wait();
+   }
+ 
+-  printf(1, "concreate ok\n");
++  printf(1, "ok\n");
+ }
+ 
+ // directory that uses indirect blocks
+@@ -751,7 +755,7 @@ bigdir(void)
+   int i, fd;
+   char name[10];
+ 
+-  printf(1, "bigdir test\n");
++  printf(1, "bigdir test: ");
+   unlink("bd");
+ 
+   fd = open("bd", O_CREATE);
+@@ -784,7 +788,7 @@ bigdir(void)
+     }
+   }
+ 
+-  printf(1, "bigdir ok\n");
++  printf(1, "ok\n");
+ }
+ 
+ void
+@@ -792,7 +796,7 @@ subdir(void)
+ {
+   int fd, cc;
+ 
+-  printf(1, "subdir test\n");
++  printf(1, "subdir test: ");
+ 
+   unlink("ff");
+   if(mkdir("dd") != 0){
+@@ -967,7 +971,7 @@ subdir(void)
+     exit();
+   }
+ 
+-  printf(1, "subdir ok\n");
++  printf(1, "ok\n");
+ }
+ 
+ void
+@@ -975,7 +979,7 @@ bigfile(void)
+ {
+   int fd, i, total, cc;
+ 
+-  printf(1, "bigfile test\n");
++  printf(1, "bigfile test: ");
+ 
+   unlink("bigfile");
+   fd = open("bigfile", O_CREATE | O_RDWR);
+@@ -1023,7 +1027,7 @@ bigfile(void)
+   }
+   unlink("bigfile");
+ 
+-  printf(1, "bigfile test ok\n");
++  printf(1, "ok\n");
+ }
+ 
+ void
+@@ -1032,7 +1036,7 @@ fourteen(void)
+   int fd;
+ 
+   // DIRSIZ is 14.
+-  printf(1, "fourteen test\n");
++  printf(1, "fourteen test: ");
+ 
+   if(mkdir("12345678901234") != 0){
+     printf(1, "mkdir 12345678901234 failed\n");
+@@ -1064,13 +1068,13 @@ fourteen(void)
+     exit();
+   }
+ 
+-  printf(1, "fourteen ok\n");
++  printf(1, "ok\n");
+ }
+ 
+ void
+ rmdot(void)
+ {
+-  printf(1, "rmdot test\n");
++  printf(1, "rmdot test: ");
+   if(mkdir("dots") != 0){
+     printf(1, "mkdir dots failed\n");
+     exit();
+@@ -1103,7 +1107,7 @@ rmdot(void)
+     printf(1, "unlink dots failed!\n");
+     exit();
+   }
+-  printf(1, "rmdot ok\n");
++  printf(1, "ok\n");
+ }
+ 
+ void
+@@ -1111,7 +1115,7 @@ dirfile(void)
+ {
+   int fd;
+ 
+-  printf(1, "dir vs file\n");
++  printf(1, "dir vs file: ");
+ 
+   fd = open("dirfile", O_CREATE);
+   if(fd < 0){
+@@ -1162,7 +1166,7 @@ dirfile(void)
+   }
+   close(fd);
+ 
+-  printf(1, "dir vs file OK\n");
++  printf(1, "ok\n");
+ }
+ 
+ // test that iput() is called at the end of _namei()
+@@ -1171,7 +1175,7 @@ iref(void)
+ {
+   int i, fd;
+ 
+-  printf(1, "empty file name\n");
++  printf(1, "empty file name: ");
+ 
+   // the 50 is NINODE
+   for(i = 0; i < 50 + 1; i++){
+@@ -1196,7 +1200,7 @@ iref(void)
+   }
+ 
+   chdir("/");
+-  printf(1, "empty file name OK\n");
++  printf(1, "ok\n");
+ }
+ 
+ // test that fork fails gracefully
+@@ -1207,7 +1211,7 @@ forktest(void)
+ {
+   int n, pid;
+ 
+-  printf(1, "fork test\n");
++  printf(1, "fork test: ");
+ 
+   for(n=0; n<1000; n++){
+     pid = fork();
+@@ -1234,14 +1238,14 @@ forktest(void)
+     exit();
+   }
+   
+-  printf(1, "fork test OK\n");
++  printf(1, "ok\n");
+ }
+ 
+ void
+ sbrktest(void)
+ {
+-  int fds[2], pid, pids[32], ppid;
+-  char *a, *b, *c, *lastaddr, *oldbrk, *p, scratch;
++  int pid, ppid;
++  char *a, *b, *c, *lastaddr, *oldbrk, *p;
+   uint amt;
+ 
+   printf(stdout, "sbrk test\n");
+@@ -1276,40 +1280,39 @@ sbrktest(void)
+ 
+   // can one allocate the full 640K?
+   a = sbrk(0);
+-  amt = (636 * 1024) - (uint)a;
++  amt = (640 * 1024) - (uint)a;
+   p = sbrk(amt);
+   if(p != a){
+     printf(stdout, "sbrk test failed 640K test, p %x a %x\n", p, a);
+     exit();
+   }
+-  lastaddr = (char*)(636 * 1024 - 1);
++  lastaddr = (char*)(640 * 1024 - 1);
+   *lastaddr = 99;
+ 
+   // is one forbidden from allocating more than 640K?
+-  c = sbrk(8192);
++  c = sbrk(4096);
+   if(c != (char*)0xffffffff){
+     printf(stdout, "sbrk allocated more than 640K, c %x\n", c);
+     exit();
+   }
+ 
+   // can one de-allocate?
+-  int changeAmt = 8192;
+   a = sbrk(0);
+-  c = sbrk(-changeAmt);
++  c = sbrk(-4096);
+   if(c == (char*)0xffffffff){
+     printf(stdout, "sbrk could not deallocate\n");
+     exit();
+   }
+   c = sbrk(0);
+-  if(c != a - changeAmt){
++  if(c != a - 4096){
+     printf(stdout, "sbrk deallocation produced wrong address, a %x c %x\n", a, c);
+     exit();
+   }
+ 
+   // can one re-allocate that page?
+   a = sbrk(0);
+-  c = sbrk(changeAmt);
+-  if(c != a || sbrk(0) != a + changeAmt){
++  c = sbrk(4096);
++  if(c != a || sbrk(0) != a + 4096){
+     printf(stdout, "sbrk re-allocation failed, a %x c %x\n", a, c);
+     exit();
+   }
+@@ -1319,7 +1322,7 @@ sbrktest(void)
+     exit();
+   }
+ 
+-  c = sbrk(8192);
++  c = sbrk(4096);
+   if(c != (char*)0xffffffff){
+     printf(stdout, "sbrk was able to re-allocate beyond 640K, c %x\n", c);
+     exit();
+@@ -1341,6 +1344,20 @@ sbrktest(void)
+     wait();
+   }
+ 
++  if(sbrk(0) > oldbrk)
++    sbrk(-(sbrk(0) - oldbrk));
++
++  printf(stdout, "sbrk test ok\n");
++}
++
++void leaktest() {
++  int pids[32];
++  int fds[2];
++  char scratch, *oldbrk, *c;
++  int i;
++
++  oldbrk = sbrk(0);
++
+   // if we run the system out of memory, does it clean up the last
+   // failed allocation?
+   sbrk(-(sbrk(0) - oldbrk));
+@@ -1392,7 +1409,6 @@ sbrktest(void)
+   if(sbrk(0) > oldbrk)
+     sbrk(-(sbrk(0) - oldbrk));
+ 
+-  printf(stdout, "sbrk test OK\n");
+ }
+ 
+ void
+@@ -1414,10 +1430,10 @@ validatetest(void)
+   int hi, pid;
+   uint p;
+ 
+-  printf(stdout, "validate test\n");
++  printf(stdout, "validate test: ");
+   hi = 1100*1024;
+ 
+-  for(p = 4096; p <= (uint)hi; p += 4096){
++  for(p = 0; p <= (uint)hi; p += 4096){
+     if((pid = fork()) == 0){
+       // try to crash the kernel by passing in a badly placed integer
+       validateint((int*)p);
+@@ -1435,7 +1451,7 @@ validatetest(void)
+     }
+   }
+ 
+-  printf(stdout, "validate ok\n");
++  printf(stdout, "ok\n");
+ }
+ 
+ // does unintialized data start out zero?
+@@ -1445,14 +1461,14 @@ bsstest(void)
+ {
+   int i;
+ 
+-  printf(stdout, "bss test\n");
++  printf(stdout, "bss test: ");
+   for(i = 0; i < sizeof(uninit); i++){
+     if(uninit[i] != '\0'){
+       printf(stdout, "bss test failed\n");
+       exit();
+     }
+   }
+-  printf(stdout, "bss test ok\n");
++  printf(stdout, "ok\n");
+ }
+ 
+ // does exec do something sensible if the arguments
+@@ -1469,9 +1485,9 @@ bigargtest(void)
+     for(i = 0; i < 32; i++)
+       args[i] = "bigargs test: failed\n                                                                                                                     ";
+     args[32] = 0;
+-    printf(stdout, "bigarg test\n");
++    printf(stdout, "bigarg test: ");
+     exec("echo", args);
+-    printf(stdout, "bigarg test ok\n");
++    printf(stdout, "ok\n");
+     exit();
+   } else if(pid < 0){
+     printf(stdout, "bigargtest: fork failed\n");
+@@ -1519,7 +1535,7 @@ main(int argc, char *argv[])
+   dirfile();
+   iref();
+   forktest();
+-  bigdir(); // slow
++  //bigdir(); // slow
+ 
+   exectest();
+ 
+diff --git a/user/usys.S b/user/usys.S
+index 8bfd8a1..beeacfc 100644
+--- a/user/usys.S
++++ b/user/usys.S
+@@ -29,3 +29,9 @@ SYSCALL(getpid)
+ SYSCALL(sbrk)
+ SYSCALL(sleep)
+ SYSCALL(uptime)
++SYSCALL(clone)
++SYSCALL(join)
++SYSCALL(getstack)
++SYSCALL(cv_wait)
++SYSCALL(cv_signal)
++
+diff --git a/user/uthreadlib.c b/user/uthreadlib.c
+new file mode 100755
+index 0000000..239b5fe
+--- /dev/null
++++ b/user/uthreadlib.c
+@@ -0,0 +1,39 @@
++#include "types.h"
++#include "user.h"
++#include "x86.h"
++
++#define PGSIZE 4096
++
++
++int
++thread_create(void (*start_routine)(void*), void* arg)
++{
++  void *stack = malloc(2 * PGSIZE);
++  if ((uint)stack % PGSIZE != 0) stack += PGSIZE - (uint)stack % PGSIZE;
++  return clone(start_routine, arg, stack);
++}
++
++int
++thread_join(int pid)
++{
++  int ustack;
++  if ((ustack = getstack(pid)) < 0) return -1;    //find ustack, see definition in proc.c
++  free((void*)ustack);
++  return join(pid);
++}
++
++void lock_acquire(lock_t* lock)
++{
++  while(xchg(lock, 1) != 0) ;
++}
++
++void lock_release(lock_t* lock)
++{
++  xchg(lock, 0);
++}
++
++void lock_init(lock_t* lock)
++{
++  *lock = 0;
++}
++
